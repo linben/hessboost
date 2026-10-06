@@ -34,6 +34,40 @@ const _: () = assert!(std::mem::size_of::<GradPair>() == 2 * std::mem::size_of::
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const MAX_FAST_EXP_INPUT: f32 = 80.0;
 
+/// How [`logistic_gradient`] runs one whole batch of rows on this machine,
+/// for a device that reproduces its vector kernel: `lanes` rows per vector
+/// over the batch's first `rows` rows, the rest scalar. A vector holding a
+/// margin of magnitude above `max_input` (or a non-finite one) also runs
+/// scalar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VectorSplit {
+    pub lanes: usize,
+    pub rows: usize,
+    pub max_input: f32,
+}
+
+/// [`VectorSplit`] of a batch of `n` rows; `None` when the logistic
+/// gradient runs scalar everywhere (no vector kernel on this machine).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) fn logistic_vector_split(n: usize) -> Option<VectorSplit> {
+    #[cfg(target_arch = "aarch64")]
+    let lanes = neon_available().then_some(aarch64::VECTOR_WIDTH);
+    #[cfg(target_arch = "x86_64")]
+    let lanes = avx2_fma_available().then_some(x86_64::WIDTH);
+    lanes.map(|lanes| VectorSplit {
+        lanes,
+        rows: if n >= MIN_SIMD_LEN { n - n % lanes } else { 0 },
+        max_input: MAX_FAST_EXP_INPUT,
+    })
+}
+
+/// [`VectorSplit`] of a batch of `n` rows; `None` when the logistic
+/// gradient runs scalar everywhere (no vector kernel on this machine).
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+pub(crate) fn logistic_vector_split(_n: usize) -> Option<VectorSplit> {
+    None
+}
+
 #[cfg(target_arch = "aarch64")]
 static NEON_AVAILABLE: LazyLock<bool> =
     LazyLock::new(|| std::arch::is_aarch64_feature_detected!("neon"));

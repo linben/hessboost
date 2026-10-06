@@ -10,7 +10,7 @@ use crate::objective::GradPair;
 use std::arch::x86_64::*;
 
 /// f32 lanes per vector.
-const WIDTH: usize = 8;
+pub(super) const WIDTH: usize = 8;
 // `objective::GRADIENT_BLOCK_ROWS`'s contract: its blocks start on vector blocks.
 const _: () = assert!(crate::objective::GRADIENT_BLOCK_ROWS.is_multiple_of(WIDTH));
 

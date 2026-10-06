@@ -1296,6 +1296,71 @@ fn bench_metal_registered(c: &mut Criterion) {
 #[cfg(not(all(target_os = "macos", feature = "metal")))]
 fn bench_metal_registered(_c: &mut Criterion) {}
 
+/// CUDA GPU benches (`cargo bench --features cuda` on Linux with an NVIDIA
+/// GPU): histogram construction and end-to-end training, each against its
+/// CPU counterpart on identical data. The GPU results are bit-identical to
+/// the CPU's, so the benches compare speed only; the per-node strategy
+/// counts are printed so a run shows how much of the work reached the GPU.
+#[cfg(all(target_os = "linux", feature = "cuda"))]
+fn bench_cuda(c: &mut Criterion) {
+    use hessboost::backend::cuda;
+    use hessboost::backend::cuda::CudaHistBackend;
+    use hessboost::config::Device;
+
+    if let Some(reason) = cuda::unavailable_reason() {
+        eprintln!("skipping cuda benches: {reason}");
+        return;
+    }
+    eprintln!("cuda device: {}", cuda::device_name().unwrap_or_default());
+    {
+        let mut group = c.benchmark_group("cuda_histogram_build");
+        group.sample_size(10);
+        for &n in &[1_000_000usize, 10_000_000] {
+            let (ghist, gpair, rows) = histogram_case(&make_data(n, 30));
+            let gpu = CudaHistBackend::new(&ghist, 0).unwrap();
+            gpu.prepare(&ghist, &gpair);
+            let mut cpu_out = zeroed(ghist.total_bins());
+            let mut gpu_out = zeroed(ghist.total_bins());
+            group.throughput(Throughput::Elements(n as u64));
+            group.bench_with_input(BenchmarkId::new("cpu", n), &n, |b, _| {
+                b.iter(|| CpuBackend.build(&ghist, &rows, &gpair, &mut cpu_out));
+            });
+            group.bench_with_input(BenchmarkId::new("cuda", n), &n, |b, _| {
+                b.iter(|| gpu.build(&ghist, &rows, &gpair, &mut gpu_out));
+            });
+            eprintln!("cuda_histogram_build/{n}: {:?}", gpu.node_counts());
+        }
+        group.finish();
+    }
+    {
+        let data = make_data(1_000_000, 30);
+        let mut group = c.benchmark_group("cuda_train_1m_x30_20rounds_depth8");
+        group.sample_size(10);
+        for (name, device) in [("cpu", Device::Cpu), ("cuda", Device::Cuda { ordinal: 0 })] {
+            let params = TrainingParams::builder()
+                .objective(Objective::SquaredError(RegLoss::default()))
+                .tree_method(TreeMethod::Hist)
+                .max_depth(8)
+                .eta(0.1)
+                .device(device)
+                .build()
+                .unwrap();
+            group.bench_function(name, |b| {
+                b.iter(|| black_box(train(&params, &data, 20).unwrap()));
+            });
+        }
+        group.finish();
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "cuda"))]
+fn bench_cuda_registered(c: &mut Criterion) {
+    bench_cuda(c);
+}
+
+#[cfg(not(all(target_os = "linux", feature = "cuda")))]
+fn bench_cuda_registered(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_histogram_build,
@@ -1315,6 +1380,7 @@ criterion_group!(
     bench_predict_csr,
     bench_model_io,
     bench_data_prep,
-    bench_metal_registered
+    bench_metal_registered,
+    bench_cuda_registered
 );
 criterion_main!(benches);

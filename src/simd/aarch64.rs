@@ -14,7 +14,7 @@ use std::arch::aarch64::*;
 // not the stdarch in use marks these intrinsics safe, without lint overrides.
 // The compiler inlines these constant function pointers.
 
-const VECTOR_WIDTH: usize = 4;
+pub(super) const VECTOR_WIDTH: usize = 4;
 // `objective::GRADIENT_BLOCK_ROWS`'s contract: its blocks start on vector blocks.
 const _: () = assert!(crate::objective::GRADIENT_BLOCK_ROWS.is_multiple_of(VECTOR_WIDTH));
 // Shared vector-loop scaffolding for the gradient and metric-sum kernels below.

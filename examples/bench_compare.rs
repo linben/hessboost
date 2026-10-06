@@ -20,8 +20,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let x_test = read_f32(&dir.join("X_test.bin"))?;
     let y_test = read_f32(&dir.join("y_test.bin"))?;
     let dtest = DMatrix::from_dense(&x_test, meta.n_test, meta.n_cols)?.with_labels(&y_test)?;
-    // The XGBoost parameter dict `scripts/bench_xgb.py` trains XGBoost with.
+    // The XGBoost parameter dict `scripts/bench_xgb.py` trains XGBoost with;
+    // `BENCH_DEVICE` is its `--device` (`cpu` unless set).
+    let device = std::env::var("BENCH_DEVICE").unwrap_or_else(|_| "cpu".to_owned());
     let mut xgboost = vec![
+        ("device", json!(device)),
         ("objective", json!(meta.objective)),
         ("tree_method", json!("hist")),
         ("grow_policy", json!("depthwise")),

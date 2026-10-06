@@ -155,10 +155,11 @@ pub enum GrowPolicy {
     Symmetric,
 }
 
-/// Which processor training runs on. XGBoost `device` (XGBoost spells its
-/// GPU choices `cuda`/`gpu`; the macOS GPU backend here is `metal`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+/// Which processor training runs on. XGBoost `device`: `cpu`, `cuda`,
+/// `cuda:<ordinal>`, and XGBoost's aliases `gpu`/`gpu:<ordinal>` for CUDA;
+/// the macOS GPU backend is `metal`. Serializes as those strings (`cuda`
+/// for ordinal 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Device {
     /// The CPU (default): always available, and what the parity fixtures
@@ -178,6 +179,77 @@ pub enum Device {
     /// prediction, through
     /// [`BoostedModel::to_gpu`](crate::model::BoostedModel::to_gpu).
     Metal,
+    /// An NVIDIA GPU through CUDA, on Linux with the `cuda` feature (see
+    /// [`backend::cuda`](crate::backend::cuda)): the tree's rows,
+    /// partitions, and histograms live on the GPU (and, for squared error
+    /// and logistic objectives in a plain `gbtree`, the margins and
+    /// gradients), reproducing single-threaded CPU training bit for bit.
+    /// Requires `tree_method = hist`/`auto` and a tree booster. Opt-in.
+    Cuda {
+        /// The CUDA device ordinal (XGBoost `cuda:<ordinal>`; `0` for
+        /// plain `cuda`).
+        ordinal: usize,
+    },
+}
+
+impl Device {
+    /// The XGBoost spellings [`Device`] parses, for error messages.
+    const SPELLINGS: &'static [&'static str] = &[
+        "cpu",
+        "metal",
+        "cuda",
+        "cuda:<ordinal>",
+        "gpu",
+        "gpu:<ordinal>",
+    ];
+
+    /// Parse an XGBoost `device` value.
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "cpu" => return Some(Device::Cpu),
+            "metal" => return Some(Device::Metal),
+            "cuda" | "gpu" => return Some(Device::Cuda { ordinal: 0 }),
+            _ => {}
+        }
+        let ordinal = value
+            .strip_prefix("cuda:")
+            .or_else(|| value.strip_prefix("gpu:"))?;
+        // Digits only: `usize::from_str` would also take a leading `+`.
+        if ordinal.is_empty() || !ordinal.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        ordinal.parse().ok().map(|ordinal| Device::Cuda { ordinal })
+    }
+}
+
+impl std::fmt::Display for Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Device::Cpu => f.write_str("cpu"),
+            Device::Metal => f.write_str("metal"),
+            Device::Cuda { ordinal: 0 } => f.write_str("cuda"),
+            Device::Cuda { ordinal } => write!(f, "cuda:{ordinal}"),
+        }
+    }
+}
+
+impl Serialize for Device {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Device {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Device::parse(&value)
+            .ok_or_else(|| serde::de::Error::unknown_variant(&value, Device::SPELLINGS))
+    }
 }
 
 /// Deepest tree `grow_policy = symmetric` grows (`2^16` leaves), CatBoost's
@@ -285,9 +357,10 @@ pub struct TrainingParams {
     /// RNG seed for subsampling and column sampling. XGBoost `seed`.
     pub seed: u64,
 
-    /// Which processor training runs on. XGBoost `device`. `metal` moves
-    /// histogram construction to the GPU (macOS, `metal` feature); the
-    /// default `cpu` leaves everything as it was.
+    /// Which processor training runs on. XGBoost `device`. `metal` (macOS,
+    /// `metal` feature) and `cuda` (Linux, `cuda` feature) move histogram
+    /// construction to the GPU; the default `cpu` leaves everything as it
+    /// was.
     pub device: Device,
 
     // ---- Learning task ----
@@ -717,38 +790,44 @@ impl TrainingParams {
         )
     }
 
-    /// The GPU backend accelerates the histogram tree method only; the
+    /// The GPU backends accelerate the histogram tree method only; the
     /// other tree methods, the quantized path, and `gblinear` have their
     /// own accumulation loops that would silently ignore the device.
     fn validate_device(&self) -> Result<()> {
-        if self.device != Device::Cpu {
-            ensure(
+        let device = self.device;
+        match device {
+            Device::Cpu => return Ok(()),
+            Device::Metal => ensure(
                 "device",
                 cfg!(all(target_os = "macos", feature = "metal")),
                 "`metal` requires building with the `metal` feature on macOS",
-            )?;
-            ensure(
+            )?,
+            Device::Cuda { .. } => ensure(
                 "device",
-                !matches!(self.tree_method, TreeMethod::Exact | TreeMethod::Approx),
-                "`metal` requires `tree_method = hist` (or `auto`)",
-            )?;
-            ensure(
-                "device",
-                self.quantized.is_none(),
-                "`metal` does not support `use_quantized_grad`",
-            )?;
-            ensure(
-                "device",
-                self.booster != BoosterKind::GbLinear,
-                "`metal` needs a tree booster (`gbtree` or `dart`)",
-            )?;
-            ensure(
-                "device",
-                !matches!(self.process_type, ProcessType::Update(_)),
-                "`metal` does not support `process_type = update` (refresh grows no trees)",
-            )?;
+                cfg!(all(target_os = "linux", feature = "cuda")),
+                format!("`{device}` requires building with the `cuda` feature on Linux"),
+            )?,
         }
-        Ok(())
+        ensure(
+            "device",
+            !matches!(self.tree_method, TreeMethod::Exact | TreeMethod::Approx),
+            format!("`{device}` requires `tree_method = hist` (or `auto`)"),
+        )?;
+        ensure(
+            "device",
+            self.quantized.is_none(),
+            format!("`{device}` does not support `use_quantized_grad`"),
+        )?;
+        ensure(
+            "device",
+            self.booster != BoosterKind::GbLinear,
+            format!("`{device}` needs a tree booster (`gbtree` or `dart`)"),
+        )?;
+        ensure(
+            "device",
+            !matches!(self.process_type, ProcessType::Update(_)),
+            format!("`{device}` does not support `process_type = update` (refresh grows no trees)"),
+        )
     }
 
     /// `base_score` and the objective settings its parameter structs cannot

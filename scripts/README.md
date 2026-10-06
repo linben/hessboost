@@ -228,5 +228,20 @@ actually used. To compare against the parity pin instead, replace the two
 `--with` options with `--with-requirements scripts/requirements-xgboost.txt`
 (XGBoost 3.4.2, a source build).
 
+`--device cuda` trains both engines on the GPU (Linux with an NVIDIA GPU):
+build the example with `--features cuda`, and use the PyPI `xgboost` wheel
+(built with CUDA 13, so the driver must support CUDA 13), since the parity
+pin is a CPU-only source build. The report records the GPU name, driver, and
+ECC mode; the warmup fit absorbs CUDA context creation and hessboost's
+kernel compilation. XGBoost's GPU sketch and gradient quantization give a
+different model than its CPU `hist`, so compare the held-out scores too.
+
+```sh
+cargo build --release --features cuda --example bench_compare
+uv run --with xgboost==3.4.1 --with numpy==2.5.2 python scripts/bench_xgb.py \
+  --hessboost target/release/examples/bench_compare \
+  --output /tmp/hessboost-xgb-cuda --threads 16 --device cuda
+```
+
 See [Performance](../docs/performance.md#xgboost-comparison) for the recorded
 comparison and workload definitions.

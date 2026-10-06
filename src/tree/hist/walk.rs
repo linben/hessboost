@@ -4,10 +4,7 @@
 //! instantiate the same sequential loops ([`accumulate`]), monomorphized
 //! over a [`Bucket`] (the histogram entry: `GradStats`, or a packed integer)
 //! and a [`RowValue`] (a row's stored statistic, turned into the value it
-//! adds to each of its bins). The feature-parallel sweep ([`by_features`])
-//! serves the `f64` build; the quantized one widens a contiguous range's
-//! values once for all its feature tasks instead, which the per-row
-//! widening here would repeat per feature.
+//! adds to each of its bins).
 //!
 //! Every traversal adds each bin's rows in the order of `rows`, ascending,
 //! so the `f64` sums are the row-order chain; tiling and grouping change
@@ -314,20 +311,40 @@ pub(super) enum SweepRows<'a> {
     Subset(&'a [u32]),
 }
 
+impl SweepRows<'_> {
+    fn len(&self) -> usize {
+        match self {
+            SweepRows::Range(range) => range.len(),
+            SweepRows::Subset(rows) => rows.len(),
+        }
+    }
+
+    /// Rows `start..end` of the listing.
+    fn part(&self, start: usize, end: usize) -> SweepRows<'_> {
+        match self {
+            SweepRows::Range(range) => SweepRows::Range(range.start + start..range.start + end),
+            SweepRows::Subset(rows) => SweepRows::Subset(&rows[start..end]),
+        }
+    }
+}
+
 /// Build `out` (overwritten) over `rows` from the column-major copy
 /// `columns`, split by feature instead of by rows: each task streams its
-/// features' columns straight into their slices of `out`. Every bin has one
-/// writer that adds its rows in ascending order, so there are no partial
-/// histograms to allocate or reduce and the result is the sequential
-/// sweep's. Tasks take as few features as keep every one of `threads`
-/// workers busy (at most four), swept together so each pass reads and
-/// widens the row values once for all of them.
+/// features' columns straight into their slices of `out`. The sums follow
+/// the blocked order (see [`super::SumOrder::Blocked`]): every
+/// `grain`-row chunk is chained from zero into a per-feature partial, and
+/// the partials are added in chunk order, the first copied, which is the
+/// row-parallel blocked build's result bit for bit. Tasks take as few
+/// features as keep every one of `threads` workers busy (at most four),
+/// swept together so each pass reads and widens the row values once for
+/// all of them.
 pub(super) fn by_features<E: Bucket, V: RowValue<E>>(
     ghist: &GHistIndex,
     columns: &Bins<'_>,
     rows: &SweepRows<'_>,
     values: &[V],
     out: &mut [E],
+    grain: usize,
     threads: usize,
 ) {
     let n_rows = ghist.n_rows();
@@ -339,20 +356,20 @@ pub(super) fn by_features<E: Bucket, V: RowValue<E>>(
         .for_each(|(task, features)| {
             let f = task * per_task;
             match columns {
-                Bins::U16(c) => feature_group(c, n_rows, f, features, rows, values),
-                Bins::U32(c) => feature_group(c, n_rows, f, features, rows, values),
+                Bins::U16(c) => feature_group(c, n_rows, f, features, rows, values, grain),
+                Bins::U32(c) => feature_group(c, n_rows, f, features, rows, values, grain),
             }
         });
 }
 
-/// Accumulation of `rows` for the (up to four) consecutive features `f..`
-/// whose histogram slices `features` holds (`features[k]` is feature
-/// `f + k`'s first global bin and its slice, overwritten), in one pass that
-/// reads each row's value once. Bins in a column are global indices, so each
-/// slice is indexed relative to its first bin; the binned-index invariant
-/// keeps every bin of a feature's column in its range, and the slice index
-/// bounds check catches any violation. Every bin receives its rows in
-/// ascending order, as in a one-feature sweep.
+/// Blocked accumulation of `rows` for the (up to four) consecutive
+/// features `f..` whose histogram slices `features` holds (`features[k]` is
+/// feature `f + k`'s first global bin and its slice, overwritten). Each
+/// chunk's sweep reads each row's value once for all the features. Bins in
+/// a column are global indices, so each slice is indexed relative to its
+/// first bin; the binned-index invariant keeps every bin of a feature's
+/// column in its range, and the slice index bounds check catches any
+/// violation.
 #[inline(always)]
 fn feature_group<E: Bucket, V: RowValue<E>, B: BinIndex>(
     columns: &[B],
@@ -361,40 +378,61 @@ fn feature_group<E: Bucket, V: RowValue<E>, B: BinIndex>(
     features: &mut [(usize, &mut [E])],
     rows: &SweepRows<'_>,
     values: &[V],
+    grain: usize,
 ) {
-    let column = |f: usize| &columns[f * n_rows..][..n_rows];
-    for (_, slice) in features.iter_mut() {
-        slice.fill(E::default());
-    }
-    match features {
-        [a] => sweep_slices([column(f)], [a], rows, values),
-        [a, b] => sweep_slices([column(f), column(f + 1)], [a, b], rows, values),
-        [a, b, c] => sweep_slices(
-            [column(f), column(f + 1), column(f + 2)],
-            [a, b, c],
-            rows,
-            values,
-        ),
-        [a, b, c, d] => sweep_slices(
-            [column(f), column(f + 1), column(f + 2), column(f + 3)],
-            [a, b, c, d],
-            rows,
-            values,
-        ),
-        _ => unreachable!("callers pass one to four features"),
+    let column = |k: usize| &columns[(f + k) * n_rows..][..n_rows];
+    // One partial per feature, reused by every chunk.
+    let mut partials: Vec<(usize, Vec<E>)> = features
+        .iter()
+        .map(|(first, slice)| (*first, vec![E::default(); slice.len()]))
+        .collect();
+    let n = rows.len();
+    for (c, start) in (0..n).step_by(grain.max(1)).enumerate() {
+        let chunk = rows.part(start, (start + grain).min(n));
+        for (_, partial) in &mut partials {
+            partial.fill(E::default());
+        }
+        match partials.as_mut_slice() {
+            [a] => sweep_slices([column(0)], [a], &chunk, values),
+            [a, b] => sweep_slices([column(0), column(1)], [a, b], &chunk, values),
+            [a, b, cc] => {
+                sweep_slices(
+                    [column(0), column(1), column(2)],
+                    [a, b, cc],
+                    &chunk,
+                    values,
+                );
+            }
+            [a, b, cc, d] => sweep_slices(
+                [column(0), column(1), column(2), column(3)],
+                [a, b, cc, d],
+                &chunk,
+                values,
+            ),
+            _ => unreachable!("callers pass one to four features"),
+        }
+        for ((_, slice), (_, partial)) in features.iter_mut().zip(&partials) {
+            if c == 0 {
+                slice.copy_from_slice(partial);
+            } else {
+                for (o, &p) in slice.iter_mut().zip(partial.iter()) {
+                    o.push(p);
+                }
+            }
+        }
     }
 }
 
 /// Add each row's value to its bin in each of the `K` full-length feature
-/// columns, into that feature's `(first bin, slice)`.
+/// columns, into that feature's `(first bin, partial)`.
 #[inline(always)]
 fn sweep_slices<const K: usize, E: Bucket, V: RowValue<E>, B: BinIndex>(
     columns: [&[B]; K],
-    slices: [&mut (usize, &mut [E]); K],
+    slices: [&mut (usize, Vec<E>); K],
     rows: &SweepRows<'_>,
     values: &[V],
 ) {
-    let mut slices = slices.map(|(first, slice)| (*first, &mut **slice));
+    let mut slices = slices.map(|(first, slice)| (*first, slice.as_mut_slice()));
     match rows {
         SweepRows::Range(range) => {
             let values = &values[range.clone()];

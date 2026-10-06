@@ -1,8 +1,10 @@
 # AGENTS.md
 
 hessboost reimplements XGBoost in Rust as one library crate. No C/C++ or FFI
-besides `zstd` (libzstd, for native model files) and, with the macOS-only
-`metal` feature, `objc2-metal`. User docs: `README.md` (overview only;
+besides `zstd` (libzstd, for native model files), with the macOS-only
+`metal` feature `objc2-metal`, and with the Linux-only `cuda` feature
+`cudarc` (the CUDA driver and NVRTC, opened at run time; building needs no
+CUDA toolkit). User docs: `README.md` (overview only;
 details belong in rustdoc), rustdoc (`src/lib.rs`, module docs),
 `examples/`, `docs/performance.md`. No changelog: release notes are written
 at release time.
@@ -15,7 +17,8 @@ cargo-nextest, uv, shellcheck, and ruff; after changing a version, refresh
 pass `--locked`.
 libzstd needs a C compiler for every build target. docs.rs builds only
 Linux (no Apple SDK for `zstd-sys`), so the Metal API renders only in a
-local macOS `cargo doc --features metal`. `include` in `Cargo.toml` lists
+local macOS `cargo doc --features metal` (and the CUDA API in a Linux
+`cargo doc --features cuda`). `include` in `Cargo.toml` lists
 what the published crate ships.
 
 ## Commands
@@ -51,12 +54,24 @@ uv run --with-requirements scripts/requirements-lightgbm.txt python scripts/gen_
 cargo nextest run --test lightgbm_parity --release --run-ignored only --no-capture
 ```
 
+CUDA (`--features cuda`, Linux): `tests/cuda.rs` compiles the kernels
+whenever `libnvrtc.so` (or `.so.12`) is loadable, GPU or not; its device
+tests skip without a GPU unless `HESSBOOST_REQUIRE_CUDA` is set, which
+turns a skip into a failure (set it on GPU machines). Without a toolkit,
+the pip `nvidia-cuda-nvrtc` wheel works: link its `libnvrtc.so.13` as
+`libnvrtc.so` and put that directory on `LD_LIBRARY_PATH`, as CI does.
+
+```sh
+HESSBOOST_REQUIRE_CUDA=1 cargo nextest run --features cuda --test cuda --release
+cargo bench --features cuda --bench training -- cuda
+```
+
 CI (`.github/workflows/ci.yml`) runs the Rust checks through `mbx` with
 `RUSTFLAGS=-D warnings`. mise-action caches mise's tools; `MISE_ENV=ci`
 loads `mise.ci.toml`, which moves rustup's toolchains into that cache. Rust
-tests run on x86_64 Linux, aarch64 Linux, and aarch64 macOS (Metal tests
-needing a device skip without one; a guard test still fails if the kernels
-do not compile) under the `ci` Cargo profile (`Cargo.toml`: `dev` at
+tests run on x86_64 Linux, aarch64 Linux, and aarch64 macOS (Metal and CUDA
+tests needing a device skip without one; guard tests still fail if the
+kernels do not compile, and the Linux jobs install NVRTC for the CUDA one) under the `ci` Cargo profile (`Cargo.toml`: `dev` at
 opt-level 1, debug assertions and overflow checks on; about ten times
 faster than opt-level 0). The parity job caches uv's XGBoost source build.
 Its Python jobs build one abi3 wheel each on x86_64/aarch64 Linux, aarch64
@@ -149,14 +164,14 @@ Fix findings rather than suppress them.
 |`check.rs`|crate-private range checks (`ensure`, `unit`, `fraction`, `positive`, `non_negative`, `narrows`) shared by the parameter constructors; keep the boundary in the message|
 |`objective/`|`spec` (`Objective`: one exhaustive match per property, `build_loss`, `ObjectiveParts`/`from_parts`/`parts`, the flat keys by XGBoost name), `params` (the validated parameter structs, shared with `EvalMetric`); losses by XGBoost family (crate-private): `absolute` (smoothed MAE), `query` (query-group validation and slicing shared by `ranking` and `xendcg`), `survival/` (`cox`, `aft`), `xendcg` (LightGBM XE-NDCG; its own keyed RNG stream), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`, `Distributional`: `family` (the `dist_families!` table, derivatives, MLE), `dist` (`Dist` ops), `count` (count sums, CRPS, quantile roots), `loss` (`DistLoss`), `special` (special functions, incl. glibc's `erf` for AFT))|
 |`metric/`|`mod.rs`: the `Metric` trait, `CustomMetric`, the SIMD-backed pointwise metrics (`CellMetric`: label-matrix row weights read strided via `simd::RowWeights`, never materialized), shared sorts; `factory` (private; `EvalMetric`, `Cutoff`, naming, `from_xgboost` reading XGBoost names with the flat parameters they borrow); by family: `curve` (AUC/AUCPR, strided per-target columns), `ranking` (NDCG/MAP/`pre`), `elementwise`, `quantile`, `survival`, `distributional` (built-in metric structs are crate-private)|
-|`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation: `mod.rs` the `f64` build strategies, `quantized`, `walk` the row/column traversal both share), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves: representation, validation, prediction), `linear_fit` (their fitting), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
+|`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation: `mod.rs` the `f64` build strategies and `sum_order`, the one definition of each bin's summation order that GPU backends reproduce, `quantized`, `walk` the row/column traversal both share), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves: representation, validation, prediction), `linear_fit` (their fitting), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
 |`tree/builder/`|`mod.rs`: `BestSplit` with its typed `SplitLocation`, XGBoost's tie rule (`need_replace`). `split`: `SplitScorer`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `categorical` (`sweep_categorical`), `shared` (`BuilderConfig` every builder derives from its params, XGBoost weights, interaction state), `partition` (`SplitRoute` row routing for hist, multi, oblivious, and budget; smaller-child-built, sibling-subtracted child histograms). `hist/` (also `approx`; speculative parallel loss-guide; `search`: its split search), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`, `online` (split ranking for `training::online`)|
 |`training/`|`api` (public `Trainer`, `train`, `TrainResult`, `EvalHistory` with its borrowed `RoundEval` rows), `train` (validation, booster dispatch, the tree loop: gbtree, DART, gblinear, forests), `prepare` (`TrainContext`, per-`tree_method` builder state; `approx` = hist with per-round weighted cuts), `round` (one iteration's trees; `process_type=update` refresh), `eval` (eval sets, metrics, `EarlyStopping`, `RoundReporter`: scores → stopping → `on_round`), `margins` (`MarginCaches`, `add_tree_margins`, shared with the online replay), `dart` (dropout, per-round RNG), `row_sampling` (`bernoulli_rows`, the Bernoulli primitive every row sampler draws with, incl. EBM's; uniform, class-balanced, and query-level rows; column samplers), `validate` (request and dataset checks), `boulevard` (BRAT-D/BRAT-P `Recursion`, shared with the honest refit), `ebm/` (`mod.rs`: dispatch and shared stage helpers; `classic` (cyclic EBM with outer bags), `boulevard` (Boulevard EBM stages on the same `Recursion`), `fast` (FAST pair ranking)), `gblinear`, `multi_output`, `sampling` (gradient-based), `sglb` (Langevin noise, leaf re-estimation, shrink schedule), `continuation`, `refresh`, `cv/` (`mod.rs`: `CrossValidation` (per-fold `target_stats`: encoder fitted on the fold's training rows), `FoldRun`, aggregation; `fold`: `Fold` builders incl. `purged_forward`), `budget` (public), `online/` (public: in-place row addition/deletion; exact mode = retraining. `mod.rs`: `OnlineModel`, `OnlineParams`/`OnlineMode`, `check_supported`, `compose`; `cache`: the approximate mode's per-tree gradients and per-node histograms, replayed from a model; `update`: the incremental top-down regrow with split robustness tolerance and lazy gradients, the loss run only on the `GRADIENT_BLOCK_ROWS` blocks holding fresh rows)|
 |`inference/`|public: Boulevard inference (`BoulevardInfo`, `BoulevardInference`, `EbmInference`, `TermBands`, `honest_refit`); `kernel` (the `Kernel` trait the solvers read; leaf kernel over the training rows), `term_kernel` (a Boulevard EBM stage's centered additive kernel, computed on term grids), `solver` (exact Cholesky or Nyström ridge solves, Gram or solution vectors), `linalg` (blocked and pivoted Cholesky, triangular solves), `refit` (`honest_refit`, Boulevard models and Boulevard EBMs), `ebm` (shape-function bands)|
 |`ebm/`|public: `EbmInfo` (terms, tree→term map, term means; crate-private `stages`, the Boulevard stage layout validation, inference, and refit share), `shape_functions`, `term_shape`, `TermShape`; `grid` (a term's cell grid from its trees' thresholds and category sets, leaves as boxes, difference arrays)|
 |`model/`|`mod.rs` (`BoostedModel`, accessors, `TreeWeights`; XGBoost interchange docs), `io` (`ModelFormat`, its detection, the four codec verbs), `embed` (`EmbeddedModel`: `include_bytes!` in a `static`, decoded on first successful `get`), `serde` (native JSON mirror `UncheckedBoostedModel`), `validate` (`validate_structure`, prediction-data and objective-width checks), `predict` (`Iterations`, prediction dispatch, `accumulate_forest`, shrunk and multi-prefix margins, `RowBlock` traversal), `slice` (`slice`, `shrunk_prefix`), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `container` (`ContainerSpec`: the magic/version/checksum framing, zstd packing and expansion bound shared by `HBM`, `HBDM` and `HBFF`; embedded-model blobs), `native`, `sections` (shared by every container and compact), `shap` (QuadratureTreeSHAP), `shrinkage` (per-iteration record; training's shrink step, shared by prediction), `uncertainty` (public, virtual ensembles), `compact/` (public, `HBTD`; `mod.rs` model and layout docs, `bitstream`, `decode`, `encode`), `xgboost/` (JSON/UBJSON schema: `document` model mapping, `tree` node columns, `objective` objective and `base_score`, `parse` scalar parsers), `categories` (`CategoryPool`, shared by the XGBoost and LightGBM importers), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
 |`diffusion/`|public, opt-in: `mod.rs` (params, `DiffusionModel`), `process` (SDE kernels, flow paths, time sampling, Box–Muller and keyed normal draws), `fit` (standardization, cross-fitted residualizer, noisy training set), `sample` (reverse SDE/ODE, `SampleOptions`, `Samples`, the borrowed `SamplesView`, `Quantiles`), `io` (`DiffusionFormat`, shared with `forest`), `format` (`HBDM` container embedding native GBDT containers; JSON), `forest/` (public, ForestFlow/ForestDiffusion: per-level GBDTs, generation, RePaint imputation; `fit`: table preparation and per-level training; `encoding`: column ranges, one-hot encoding, scaling; `format`: `HBFF`)|
-|`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
+|`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `cuda/` (`mod.rs`: device opening, `CudaHistBackend` with its four per-node sum strategies, its `RowEngine` (partition, level histograms, the resident histogram pool with sibling subtraction and split scan, device-side gradients and margins), `NodeCounts`; `compile.rs`: NVRTC to CUBIN for the device's architecture; `kernels.cu`), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
 
 Tests: `tests/parity.rs` and `tests/lightgbm_parity.rs` are ignored without fixtures; `properties.rs` is
@@ -219,8 +234,23 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   goes to the GPU only where the CPU's `f64` sums are also exact
   (`n * max <= 2^53` grains, `backend/exact_sum.rs`). Everything else
   (small nodes, non-finite gradients, failed command buffers) runs on CPU.
+- **CUDA:** `device = cuda` reproduces the single-threaded CPU model bit
+  for bit, per node, following `tree::hist::sum_order`: exact integer sums
+  when the node's sums are exact, exact integer chunks reduced in `f64` in
+  chunk order when only the chunks are, otherwise one GPU thread per
+  (chunk, feature) running the CPU's `f64` chain (kernels compiled with
+  `--fmad=false`, no FTZ, IEEE division; no floating-point atomics), and
+  the CPU for a large single-chain node outside the exact domain. Inputs
+  that do not fit and every node after a CUDA error run on the CPU. Rows
+  stay on the device (`tree::hist::RowEngine`); on numeric features the
+  histograms do too, with the split scan run there in `split.rs`'s
+  arithmetic and merged on the host (a NaN scan falls back to the host
+  search). Device-side rounds (`training/round.rs::device_round`) compute
+  squared-error and logistic gradients from device margins; the logistic
+  kernel reproduces the host's AVX2/NEON `exp_f32`, so it needs that path
+  (`simd::logistic_vector_split`) and leaves the scalar tail to the host.
 - **Unsafe:** only in `simd/`, hot loops of `tree/compact.rs`, `tree/hist/`,
-  `tree/builder/partition.rs`, and `backend/metal.rs`. Each block needs
+  `tree/builder/partition.rs`, `backend/metal.rs`, and `backend/cuda/`. Each block needs
   `// SAFETY:`.
 - **SIMD:** covers objective gradients, exp/sigmoid/softmax, metric sums,
   cut search (`count_le`), and SHAP's per-lane kernels (return-edge terms

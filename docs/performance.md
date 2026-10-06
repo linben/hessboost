@@ -777,6 +777,47 @@ cargo run --release --features metal --example metal
 
 Hosted macOS CI has no Metal device: those tests skip there.
 
+## CUDA GPU (Linux)
+
+The `cuda` feature adds an NVIDIA backend (`src/backend/cuda/mod.rs` has the
+design and exactness contract); every model it trains is byte-identical to
+single-threaded CPU training. **AWS g6e.4xlarge**: NVIDIA L40S (driver
+595.91.07, ECC on), AMD EPYC 7R13 (16 vCPUs), Rust 1.98.1, 2026-10-06.
+
+Against XGBoost 3.4.1's PyPI wheel (CUDA 13.3) with `device=cuda`, through
+`scripts/bench_xgb.py --device cuda --threads 16` (100 rounds, depth 6, 256
+bins, `eta=0.1`; fresh matrix preparation plus training, median of six fits):
+
+| Workload | hessboost (CUDA) | XGBoost 3.4.1 (CUDA) | Held-out score (both) |
+|---|---:|---:|---|
+| Regression, 1M × 30 | 0.501 s | 0.652 s | RMSE 0.057865 |
+| Binary, 1M × 30 | 0.500 s | 0.652 s | logloss 0.511879 |
+| Regression, 10M × 30 | 4.087 s | 5.750 s | RMSE 0.056821 |
+| Binary, 10M × 30 | 3.920 s | 5.766 s | logloss 0.512848 |
+
+The held-out scores agree to eight digits. At 10M rows about 2.7 s of
+hessboost's time is matrix preparation (the quantile sketch and binning, on
+the CPU, so that the cuts stay the CPU's); the rounds themselves take about
+17 ms at depth 8 (CPU: 350 ms; XGBoost on the GPU: 25 ms).
+
+The crate's `cuda` benches (`cargo bench --features cuda --bench training --
+cuda`):
+
+| Bench | CPU (16 threads) | CUDA | Speedup |
+|---|---:|---:|---:|
+| Histogram build, 1M rows × 30 | 4.37 ms | 0.825 ms | **5.3×** |
+| Histogram build, 10M rows × 30 | 37.7 ms | 7.62 ms | **4.9×** |
+| Train, 1M × 30, depth 8, 20 rounds | 837 ms | 334 ms | **2.5×** |
+
+Where the time goes: each depthwise level is one partition, one batch of
+histogram builds (shared-memory integer histograms in 512-thread blocks,
+three resident per SM), the sibling subtractions, and one split-scan launch
+(one warp per node and feature: lane 0 forms the CPU's sequential prefix
+chain, the lanes score candidates in parallel, which is where the `f64`
+divisions run at Ada's 1/64 rate). The host merges per-feature winners and
+decides the tree; for squared error and logistic objectives the gradients
+and margins never leave the GPU.
+
 ## Reproduce the measurements
 
 Benchmarks live in [`benches/training.rs`](../benches/training.rs). Run the

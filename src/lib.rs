@@ -195,7 +195,14 @@
 //!     ([`device`](config::TrainingParams::device) = `metal`; exact integer
 //!     sums, CPU fallback outside their exact domain). Documented only in
 //!     macOS builds with the feature (`cargo doc --features metal`);
-//!     elsewhere [`backend::metal`] is a stub.
+//!     elsewhere [`backend::metal`] is a stub;
+//!   - NVIDIA CUDA on Linux (`cuda` feature): bit-identical GPU training
+//!     ([`device`](config::TrainingParams::device) = `cuda`/`cuda:<n>`;
+//!     exact integer sums, `f64` chains in the CPU's order outside them),
+//!     with the rows, histograms, and split scans resident on the GPU, and
+//!     whole rounds there for squared error and logistic objectives;
+//!     loading the driver and NVRTC at run time. Documented in Linux builds
+//!     with the feature; elsewhere [`backend::cuda`] is a stub.
 //!
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`,
@@ -218,7 +225,8 @@
 //! forests, DART) match in quality only — the random streams differ.
 //! ### Not implemented
 //!
-//! - Distributed and external-memory training; GPU training outside macOS.
+//! - Distributed and external-memory training; GPU training on Windows;
+//!   GPU prediction outside macOS.
 //! - XGBoost options available at one setting only (so they are not
 //!   [`TrainingParams`] fields; `from_xgboost` accepts exactly that
 //!   setting): gblinear uses `updater = coord_descent`
@@ -298,6 +306,8 @@ pub mod prelude {
 /// part of the public API: hidden from the docs and changed without notice.
 #[doc(hidden)]
 pub mod internals {
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    pub use crate::backend::cuda::compile::compile_kernels;
     pub use crate::data::ghist::GHistIndex;
     pub use crate::data::quantile::HistCuts;
     pub use crate::tree::builder::HistTreeBuilder;

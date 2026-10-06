@@ -6,6 +6,7 @@
 //! is ever built directly. Supports `depthwise` and `lossguide` growth, and
 //! hands `symmetric` growth to the level-wise oblivious builder.
 
+mod device;
 mod search;
 
 use super::lightgbm::{SplitOptions, finalize_smoothed_leaves};
@@ -22,7 +23,7 @@ use crate::objective::GradPair;
 use crate::tree::constraints::Bounds;
 use crate::tree::gain::GradStats;
 use crate::tree::hist::quantized::QuantNode;
-use crate::tree::hist::{CpuBackend, Histogram, HistogramBackend, zeroed};
+use crate::tree::hist::{CpuBackend, HistSlot, Histogram, HistogramBackend, Segment, zeroed};
 use crate::tree::regtree::RegTree;
 use crate::tree::reuse::{HistReuse, ReuseSet};
 use crate::tree::sampler::{ColumnSampler, FeatureSet};
@@ -65,7 +66,10 @@ pub(super) struct NodeCtx {
 struct NodeEntry {
     nid: usize,
     depth: usize,
+    /// The node's rows on the host (empty when `seg` holds them).
     rows: Vec<u32>,
+    /// The node's rows on the device, under device-resident growth.
+    seg: Option<Segment>,
     hist: Histogram,
     best: BestSplit,
     bounds: Bounds,
@@ -78,6 +82,9 @@ struct NodeEntry {
     /// Quantized histogram (`use_quantized_grad`); `hist` then holds its
     /// dequantized copy for split evaluation.
     quant: Option<QuantNode>,
+    /// The node's histogram in a row engine's slot under resident growth
+    /// (`hist` is then empty).
+    slot: Option<HistSlot>,
 }
 
 /// Tree expansion and sampling happen in node order, so the expensive row and
@@ -225,16 +232,29 @@ impl<'a> HistTreeBuilder<'a> {
                 .as_ref()
                 .is_none_or(|r| r.n_bins() == ghist.total_bins())
         );
+        // A device that keeps the rows grows the tree there. It may fail
+        // part way (a device error); the tree is then regrown here from the
+        // sampler's state at the start, so the result is unchanged.
+        if let Some(engine) = self.device_engine() {
+            let start = sampler.clone();
+            let report = if capture_rows {
+                device::LeafReport::Rows
+            } else {
+                device::LeafReport::Nothing
+            };
+            if let Some((tree, leaf_rows, _)) =
+                self.build_on_device(engine, ghist, Some(gpair), row_subset, sampler, report)
+            {
+                return (tree, leaf_rows);
+            }
+            *sampler = start;
+        }
         // Leaf renewal recomputes leaf values from full-precision sums, which
         // needs every leaf's rows.
         let renew = self.config.params.quantized.is_some_and(|q| q.renew_leaf());
         let (root, root_stats) = self.root(ghist, gpair, row_subset, sampler);
         let mut tree = RegTree::with_root(root_stats.hess as f32);
-        let mut store = NodeStore {
-            stats: vec![root_stats],
-            bounds: vec![Bounds::default()],
-            leaf_rows: (capture_rows || renew).then(Vec::new),
-        };
+        let mut store = NodeStore::new(root_stats, capture_rows || renew);
 
         match self.config.params.grow_policy {
             GrowPolicy::DepthWise => {
@@ -251,20 +271,24 @@ impl<'a> HistTreeBuilder<'a> {
                 store.stats[leaf.node] = sum_rows(gpair, &leaf.rows);
             }
         }
-        // Finalize leaf weights (respecting each leaf's monotone bounds).
-        // Path-smoothed leaves already hold the outputs their splits chose.
-        match &self.options {
-            Some(options) if options.smoothing() => {
-                finalize_smoothed_leaves(&mut tree, root_stats, &self.config.reg);
-            }
-            _ => finalize_leaf_values(&mut tree, &store.stats, &store.bounds, &self.config.reg),
-        }
+        self.finish_tree(&mut tree, &store, root_stats);
         let leaf_rows = if capture_rows {
             store.leaf_rows.unwrap_or_default()
         } else {
             Vec::new()
         };
         (tree, leaf_rows)
+    }
+
+    /// Finalize leaf weights (respecting each leaf's monotone bounds).
+    /// Path-smoothed leaves already hold the outputs their splits chose.
+    fn finish_tree(&self, tree: &mut RegTree, store: &NodeStore, root_stats: GradStats) {
+        match &self.options {
+            Some(options) if options.smoothing() => {
+                finalize_smoothed_leaves(tree, root_stats, &self.config.reg);
+            }
+            _ => finalize_leaf_values(tree, &store.stats, &store.bounds, &self.config.reg),
+        }
     }
 
     /// The root node (its histogram, statistics, and best split) of a tree
@@ -297,7 +321,41 @@ impl<'a> HistTreeBuilder<'a> {
                 };
                 (root_stats, root_hist, None)
             };
+        let root = self.root_entry(ghist, sampler, root_stats, root_hist, row_subset.len());
+        let root = NodeEntry {
+            rows: row_subset.to_vec(),
+            quant: root_quant,
+            ..root
+        };
+        (root, root_stats)
+    }
 
+    /// The root entry of `rows` rows with statistics `root_stats` and
+    /// histogram `root_hist`, drawing the root's column sample and finding
+    /// its best split. Its rows are left empty for the caller.
+    fn root_entry(
+        &self,
+        ghist: &GHistIndex,
+        sampler: &mut ColumnSampler,
+        root_stats: GradStats,
+        root_hist: Histogram,
+        rows: usize,
+    ) -> NodeEntry {
+        let (root_feats, root_ctx) = self.root_context(sampler, root_stats, rows);
+        let best = self.evaluate(ghist, &root_hist, &root_feats, None, root_ctx);
+        NodeEntry {
+            hist: root_hist,
+            ..Self::root_node(root_ctx.tree_seed, best)
+        }
+    }
+
+    /// The root's sampled features and split-search context.
+    fn root_context(
+        &self,
+        sampler: &mut ColumnSampler,
+        root_stats: GradStats,
+        rows: usize,
+    ) -> (FeatureSet, NodeCtx) {
         // Per-node column sampling (bylevel ∘ bynode) draws a fresh subset here.
         let root_feats = sampler.sample(0);
         let tree_seed = sampler.seed();
@@ -305,23 +363,28 @@ impl<'a> HistTreeBuilder<'a> {
             id: 0,
             stats: root_stats,
             bounds: Bounds::default(),
-            rows: row_subset.len(),
+            rows,
             output: xgb_calc_weight(root_stats, &self.config.reg),
             tree_seed,
         };
-        let best = self.evaluate(ghist, &root_hist, &root_feats, None, root_ctx);
-        let root = NodeEntry {
+        (root_feats, root_ctx)
+    }
+
+    /// The root's entry with split `best`, no rows and no histogram.
+    fn root_node(tree_seed: u64, best: BestSplit) -> NodeEntry {
+        NodeEntry {
             nid: 0,
             depth: 0,
-            rows: row_subset.to_vec(),
-            hist: root_hist,
+            rows: Vec::new(),
+            seg: None,
+            hist: Vec::new(),
             best,
             bounds: Bounds::default(),
             allowed: None,
             tree_seed,
-            quant: root_quant,
-        };
-        (root, root_stats)
+            quant: None,
+            slot: None,
+        }
     }
 
     fn grow_depthwise(
@@ -476,12 +539,14 @@ impl<'a> HistTreeBuilder<'a> {
                 nid: entry.nid,
                 depth: entry.depth,
                 rows: entry.rows.clone(),
+                seg: None,
                 hist: entry.hist.clone(),
                 best: entry.best.clone(),
                 bounds: entry.bounds,
                 allowed: entry.allowed.clone(),
                 tree_seed: entry.tree_seed,
                 quant: None,
+                slot: None,
             },
             left_id: 0,
             right_id: 0,
@@ -558,35 +623,16 @@ impl<'a> HistTreeBuilder<'a> {
         &self,
         ghist: &GHistIndex,
         gpair: &[GradPair],
-        split: PendingSplit,
+        mut split: PendingSplit,
     ) -> (NodeEntry, NodeEntry) {
-        let PendingSplit {
-            entry,
-            left_id,
-            right_id,
-            left_bounds: lb_bounds,
-            right_bounds: rb_bounds,
-            left_features,
-            right_features,
-            terminal,
-        } = split;
-        let NodeEntry {
-            depth: parent_depth,
-            rows: parent_rows,
-            hist: parent_hist,
-            best,
-            allowed: parent_allowed,
-            tree_seed,
-            quant: parent_quant,
-            ..
-        } = entry;
-        let b = &best;
-
-        let (left_rows, right_rows) = partition_rows(ghist, &parent_rows, b.route());
+        let parent_rows = std::mem::take(&mut split.entry.rows);
+        let parent_hist = std::mem::take(&mut split.entry.hist);
+        let parent_quant = split.entry.quant.take();
+        let (left_rows, right_rows) = partition_rows(ghist, &parent_rows, split.entry.best.route());
         drop(parent_rows);
 
         let (mut left_quant, mut right_quant) = (None, None);
-        let (left_hist, right_hist) = if terminal {
+        let (left_hist, right_hist) = if split.terminal {
             (Vec::new(), Vec::new())
         } else if let Some(quant) = parent_quant {
             let ((lq, lh), (rq, rh)) = quant.children(ghist, &left_rows, &right_rows, parent_hist);
@@ -602,10 +648,83 @@ impl<'a> HistTreeBuilder<'a> {
                 parent_hist,
             )
         };
+        let child = |rows: Vec<u32>, hist, quant| Child {
+            len: rows.len(),
+            rows,
+            seg: None,
+            hist,
+            quant,
+        };
+        self.finish_children(
+            ghist,
+            split,
+            child(left_rows, left_hist, left_quant),
+            child(right_rows, right_hist, right_quant),
+            None,
+        )
+    }
 
+    /// The interaction state both children of `split` share and their
+    /// split-search contexts (`left_len`/`right_len` rows).
+    fn child_contexts(
+        &self,
+        split: &PendingSplit,
+        left_len: usize,
+        right_len: usize,
+    ) -> (Option<InteractionState>, NodeCtx, NodeCtx) {
+        let entry = &split.entry;
+        let b = &entry.best;
         // Both children share the state derived from the complete updated path:
         // path features plus groups containing every feature on that path.
-        let child_allowed = self.config.next_allowed(parent_allowed.as_ref(), b.feature);
+        let child_allowed = self.config.next_allowed(entry.allowed.as_ref(), b.feature);
+        // Under path smoothing each child's output is the one its split
+        // recorded; it is the parent output of the child's own children.
+        let left_ctx = NodeCtx {
+            id: split.left_id,
+            stats: b.left,
+            bounds: split.left_bounds,
+            rows: left_len,
+            output: b.w_left,
+            tree_seed: entry.tree_seed,
+        };
+        let right_ctx = NodeCtx {
+            id: split.right_id,
+            stats: b.right,
+            bounds: split.right_bounds,
+            rows: right_len,
+            output: b.w_right,
+            tree_seed: entry.tree_seed,
+        };
+        (child_allowed, left_ctx, right_ctx)
+    }
+
+    /// Both children of `split` from their rows and histograms (empty for
+    /// terminal splits): their interaction state and best splits, searched
+    /// here unless `searched` holds them.
+    fn finish_children(
+        &self,
+        ghist: &GHistIndex,
+        split: PendingSplit,
+        left: Child,
+        right: Child,
+        searched: Option<(BestSplit, BestSplit)>,
+    ) -> (NodeEntry, NodeEntry) {
+        let (child_allowed, left_ctx, right_ctx) = self.child_contexts(&split, left.len, right.len);
+        let PendingSplit {
+            entry,
+            left_id,
+            right_id,
+            left_bounds: lb_bounds,
+            right_bounds: rb_bounds,
+            left_features,
+            right_features,
+            terminal,
+        } = split;
+        let NodeEntry {
+            depth: parent_depth,
+            tree_seed,
+            ..
+        } = entry;
 
         // The children's split searches are independent; near the root, where
         // the frontier holds too few nodes to occupy the pool, running them
@@ -613,59 +732,58 @@ impl<'a> HistTreeBuilder<'a> {
         // its sequential candidate order, so the chosen split is identical.
         let (left_best, right_best) = if terminal {
             (BestSplit::none(), BestSplit::none())
+        } else if let Some(searched) = searched {
+            searched
         } else {
             let allowed = child_allowed.as_ref();
-            // Under path smoothing each child's output is the one its split
-            // recorded; it is the parent output of the child's own children.
-            let left_ctx = NodeCtx {
-                id: left_id,
-                stats: b.left,
-                bounds: lb_bounds,
-                rows: left_rows.len(),
-                output: b.w_left,
-                tree_seed,
-            };
-            let right_ctx = NodeCtx {
-                id: right_id,
-                stats: b.right,
-                bounds: rb_bounds,
-                rows: right_rows.len(),
-                output: b.w_right,
-                tree_seed,
-            };
-            let left = || self.evaluate(ghist, &left_hist, &left_features, allowed, left_ctx);
-            let right = || self.evaluate(ghist, &right_hist, &right_features, allowed, right_ctx);
-            if left_rows.len() + right_rows.len() >= PARALLEL_EVALUATE_ROWS && rayon_available() {
-                rayon::join(left, right)
+            let eval_left = || self.evaluate(ghist, &left.hist, &left_features, allowed, left_ctx);
+            let eval_right =
+                || self.evaluate(ghist, &right.hist, &right_features, allowed, right_ctx);
+            if left.len + right.len >= PARALLEL_EVALUATE_ROWS && rayon_available() {
+                rayon::join(eval_left, eval_right)
             } else {
-                (left(), right())
+                (eval_left(), eval_right())
             }
         };
 
         let left = NodeEntry {
             nid: left_id,
             depth: parent_depth + 1,
-            rows: left_rows,
-            hist: left_hist,
+            rows: left.rows,
+            seg: left.seg,
+            hist: left.hist,
             best: left_best,
             bounds: lb_bounds,
             allowed: child_allowed.clone(),
             tree_seed,
-            quant: left_quant,
+            quant: left.quant,
+            slot: None,
         };
         let right = NodeEntry {
             nid: right_id,
             depth: parent_depth + 1,
-            rows: right_rows,
-            hist: right_hist,
+            rows: right.rows,
+            seg: right.seg,
+            hist: right.hist,
             best: right_best,
             bounds: rb_bounds,
             allowed: child_allowed,
             tree_seed,
-            quant: right_quant,
+            quant: right.quant,
+            slot: None,
         };
         (left, right)
     }
+}
+
+/// One child's rows (on the host, or a device segment) and histograms,
+/// handed to [`HistTreeBuilder::finish_children`].
+struct Child {
+    len: usize,
+    rows: Vec<u32>,
+    seg: Option<Segment>,
+    hist: Histogram,
+    quant: Option<QuantNode>,
 }
 
 /// The nodes whose children loss-guided growth builds together: `entry` (the
@@ -688,15 +806,29 @@ struct NodeStore {
     stats: Vec<GradStats>,
     bounds: Vec<Bounds>,
     leaf_rows: Option<Vec<LeafRows>>,
+    /// Leaves whose rows are still on the device, in record order.
+    device_leaves: Vec<(usize, Segment)>,
 }
 
 impl NodeStore {
+    fn new(root_stats: GradStats, keep_rows: bool) -> Self {
+        NodeStore {
+            stats: vec![root_stats],
+            bounds: vec![Bounds::default()],
+            leaf_rows: keep_rows.then(Vec::new),
+            device_leaves: Vec::new(),
+        }
+    }
+
     fn record_leaf(&mut self, entry: NodeEntry) {
         if let Some(leaves) = &mut self.leaf_rows {
-            leaves.push(LeafRows {
-                node: entry.nid,
-                rows: entry.rows,
-            });
+            match entry.seg {
+                Some(seg) => self.device_leaves.push((entry.nid, seg)),
+                None => leaves.push(LeafRows {
+                    node: entry.nid,
+                    rows: entry.rows,
+                }),
+            }
         }
     }
 

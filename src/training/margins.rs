@@ -90,6 +90,19 @@ impl<'a> MarginCaches<'a> {
         }
     }
 
+    /// Add `tree`'s predictions to the eval sets' caches only: the training
+    /// margins are kept elsewhere (on a GPU, by device-resident rounds).
+    pub(super) fn add_tree_to_evals(&mut self, tree: &RegTree, output: TreeOutput) {
+        for (margins, set) in self.evals.iter_mut().zip(self.eval_sets) {
+            add_tree_margins(tree, set.data, margins, self.n_out, output);
+        }
+    }
+
+    /// Recompute the training matrix's cache from `model`.
+    pub(super) fn recompute_train(&mut self, model: &BoostedModel) {
+        self.train = model.margin_from_trees(self.dtrain, 0..model.num_trees());
+    }
+
     /// Multiply every cached margin by `factor` (model shrinkage,
     /// [`shrink_margins`], the step prediction repeats). Cells are
     /// independent, so the parallel pass gives the serial result.

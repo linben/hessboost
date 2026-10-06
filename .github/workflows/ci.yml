@@ -85,6 +85,17 @@ jobs:
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: test-ci
+      # NVRTC alone (no driver, no GPU): `tests/cuda.rs` then compiles the
+      # CUDA kernels for every target architecture, while the tests that
+      # need a device skip. The wheel ships only `libnvrtc.so.13`, so link
+      # the `libnvrtc.so` name the loader looks for.
+      - name: Install NVRTC
+        if: runner.os == 'Linux'
+        run: |
+          uv pip install --quiet --target "$RUNNER_TEMP/nvrtc" nvidia-cuda-nvrtc==13.4.92
+          so=$(find "$RUNNER_TEMP/nvrtc" -name 'libnvrtc.so.[0-9]*' ! -name '*builtins*' | head -1)
+          ln -sf "$so" "$(dirname "$so")/libnvrtc.so"
+          echo "LD_LIBRARY_PATH=$(dirname "$so")" >> "$GITHUB_ENV"
       # The `ci` Cargo profile (Cargo.toml): opt-level 1 with debug
       # assertions, about ten times faster than `dev` for this suite.
       # nextest's own `--profile` would pick a nextest profile.

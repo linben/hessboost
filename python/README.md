@@ -507,8 +507,9 @@ LightGBM's `rank_xendcg` stream.
 - Not available: `DMatrix` from files or `QuantileDMatrix`, `inplace_predict`
   (`predict` takes arrays directly), `Booster.get_dump`/`trees_to_dataframe`
   /`dump_model`, attributes (`set_attr`), plotting, distributed (Dask/Spark)
-  and CUDA training, `approx_contribs`, and `strict_shape`. The macOS wheels
-  support `device="metal"` (GPU histograms while training).
+  and CUDA training (the Rust crate's `cuda` feature is not in the wheels
+  yet), `approx_contribs`, and `strict_shape`. The macOS wheels support
+  `device="metal"` (GPU histograms while training).
 
 ## Development
 

@@ -1,4 +1,4 @@
-//! The exactness domain of the Metal backend's histogram sums.
+//! The exactness domain of the GPU backends' integer histogram sums.
 //!
 //! The CPU accumulates each histogram bin in `f64`: a chain of additions in
 //! row order within each fixed block of rows, then the block partials in
@@ -62,6 +62,26 @@ impl SumDomain {
         finite: true,
     };
 
+    /// The statistics a device folded (the CUDA `grad_domain` kernel): the
+    /// largest magnitude's bits, the smallest grain plus 150 (`u32::MAX`
+    /// when every value is zero), and whether every value is finite. The
+    /// fold is order-free, so this equals [`of`](Self::of) of the values.
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "cuda")),
+        allow(dead_code, reason = "only the CUDA backend folds on the device")
+    )]
+    pub(crate) fn from_device(max_bits: u32, grain_code: u32, finite: bool) -> Self {
+        Self {
+            max: f32::from_bits(max_bits),
+            grain: if grain_code == u32::MAX {
+                i32::MAX
+            } else {
+                grain_code as i32 - 150
+            },
+            finite,
+        }
+    }
+
     /// The statistics of `values`, folded over the row chunks in parallel.
     ///
     /// The fold's result does not depend on the order — `max` of
@@ -109,6 +129,18 @@ impl SumDomain {
         })
     }
 
+    /// Whether every value is finite (no NaN, no infinity).
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "cuda")),
+        allow(
+            dead_code,
+            reason = "only the CUDA backend routes non-finite slices itself"
+        )
+    )]
+    pub(crate) fn is_finite(&self) -> bool {
+        self.finite
+    }
+
     /// Whether every sum of at most `n` of the values, in any order and
     /// grouping, is computed exactly by both the CPU's `f64` sums and the
     /// GPU's integer accumulation of [`units`](Self::units), so that the
@@ -132,6 +164,10 @@ impl SumDomain {
     /// slice). The scatter kernel splits each grain count into a high and a
     /// low 16-bit piece, and a threadgroup's high-piece sum must stay inside
     /// an `i32`, so this bounds how many rows one threadgroup may scan.
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "metal")),
+        allow(dead_code, reason = "only the Metal backend bounds its 32-bit pieces")
+    )]
     pub(crate) fn max_units(&self) -> u64 {
         if self.grain == i32::MAX {
             return 0;
@@ -144,19 +180,41 @@ impl SumDomain {
     /// holds for one value); otherwise (non-finite values, magnitudes past
     /// `2^63` grains) the saturating conversion keeps it defined, and such
     /// slices never reach the GPU.
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "metal")),
+        allow(dead_code, reason = "the Metal backend stages grains on the host")
+    )]
     pub(crate) fn units(&self, x: f32) -> i64 {
-        if self.grain == i32::MAX {
-            return 0;
-        }
-        (f64::from(x) * pow2(-self.grain)) as i64
+        (f64::from(x) * self.unit_scale()) as i64
     }
 
     /// A GPU sum of grains back in value space, exactly (see the proof).
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "metal")),
+        allow(dead_code, reason = "the Metal backend scales sums on the host")
+    )]
     pub(crate) fn value(&self, units: i64) -> f64 {
+        units as f64 * self.value_scale()
+    }
+
+    /// The factor [`units`](Self::units) multiplies by before truncating:
+    /// `2^-grain`, or `0` for an all-zero slice (so every value stages as
+    /// `0`). A device staging the grains itself computes `units(x)` as
+    /// `(f64::from(x) * unit_scale) as i64`.
+    pub(crate) fn unit_scale(&self) -> f64 {
         if self.grain == i32::MAX {
             return 0.0;
         }
-        units as f64 * pow2(self.grain)
+        pow2(-self.grain)
+    }
+
+    /// The factor [`value`](Self::value) multiplies by: `2^grain`, or `0`
+    /// for an all-zero slice.
+    pub(crate) fn value_scale(&self) -> f64 {
+        if self.grain == i32::MAX {
+            return 0.0;
+        }
+        pow2(self.grain)
     }
 }
 

@@ -36,6 +36,21 @@ zstd = { version = "0.14", default-features = false }
 # macOS (Apple Silicon and Intel Macs with a Metal GPU). Opt-in and
 # off by default; see `src/backend/`.
 metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
+# NVIDIA CUDA acceleration for histogram training on Linux. Opt-in and off
+# by default; `libcuda` (the driver, CUDA 12.8 or later) and `libnvrtc` are
+# loaded at run time, so building needs no CUDA toolkit. See `src/backend/`.
+cuda = ["dep:cudarc"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `cuda-12080`: the oldest driver API the backend needs (CUDA 12.8), so any
+# newer driver loads it; `dynamic-loading` opens the libraries at run time.
+cudarc = { version = "0.19.10", default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "dynamic-loading",
+    "cuda-12080",
+], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std"], optional = true }

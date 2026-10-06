@@ -86,6 +86,46 @@ fn xgboost_spellings_parse_and_round_trip() {
     assert_eq!(rank.objective, Objective::RankNdcg(LambdaRank::default()));
 }
 
+/// XGBoost's `device` spellings: `cuda` and its alias `gpu`, each with an
+/// optional ordinal; a device serializes back to `cpu`, `metal`, `cuda`, or
+/// `cuda:<ordinal>`. Anything else is refused rather than read as a device.
+#[test]
+fn device_spellings_parse_and_round_trip() {
+    let parse = |s: &str| serde_json::from_value::<Device>(json!(s)).ok();
+    let cuda = |ordinal| Some(Device::Cuda { ordinal });
+    assert_eq!(parse("cpu"), Some(Device::Cpu));
+    assert_eq!(parse("metal"), Some(Device::Metal));
+    assert_eq!(parse("cuda"), cuda(0));
+    assert_eq!(parse("gpu"), cuda(0));
+    assert_eq!(parse("cuda:3"), cuda(3));
+    assert_eq!(parse("gpu:12"), cuda(12));
+    for bad in [
+        "", "CUDA", "cuda:", "cuda:x", "cuda:+1", "gpu:-1", "cuda:1:2", "cuda: 1",
+    ] {
+        assert_eq!(parse(bad), None, "{bad:?}");
+    }
+    assert_eq!(json!(Device::Cuda { ordinal: 0 }), json!("cuda"));
+    for device in [
+        Device::Cpu,
+        Device::Metal,
+        Device::Cuda { ordinal: 0 },
+        Device::Cuda { ordinal: 7 },
+    ] {
+        assert_eq!(parse(json!(device).as_str().unwrap()), Some(device));
+    }
+    // Through the flat form: accepted where the backend is compiled in,
+    // otherwise refused under `device`.
+    let flat = TrainingParams::from_xgboost([("device", json!("gpu:2"))]);
+    if cfg!(all(target_os = "linux", feature = "cuda")) {
+        assert_eq!(flat.unwrap().device, Device::Cuda { ordinal: 2 });
+    } else {
+        assert!(matches!(
+            flat,
+            Err(HessboostError::InvalidParameter { name: "device", .. })
+        ));
+    }
+}
+
 /// A key of an option group means nothing while the group's switch is
 /// off, so it is refused by name rather than ignored.
 #[test]

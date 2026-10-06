@@ -44,8 +44,11 @@ pub(super) fn validate(params: &TrainingParams, n_outputs: usize) -> Result<()> 
     if vector_leaf(params, n_outputs) && params.device != Device::Cpu {
         return Err(HessboostError::invalid_param(
             "device",
-            "`metal` does not support `multi_strategy = multi_output_tree` \
-             (the vector-leaf builder has its own histogram loop)",
+            format!(
+                "`{}` does not support `multi_strategy = multi_output_tree` \
+                 (the vector-leaf builder has its own histogram loop)",
+                params.device
+            ),
         ));
     }
     Ok(())

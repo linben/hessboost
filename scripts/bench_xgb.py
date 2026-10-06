@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Compare CPU histogram training with XGBoost on shared synthetic datasets.
+"""Compare histogram training with XGBoost on shared synthetic datasets.
 
 Run with uv and a compiled --hessboost example. Both engines time fresh training
 matrix construction plus training; file I/O, warmup, and evaluation are excluded.
+`--device cuda` trains both on the GPU: XGBoost needs a CUDA build (the PyPI
+wheel; the parity requirement's source build is CPU-only), and the example a
+`--features cuda` build. The warmup fit absorbs CUDA context creation and
+kernel compilation.
 """
 
 import argparse
@@ -89,7 +93,7 @@ def test_score(preds, labels, metric):
     return float(np.mean(-(labels * np.log(preds) + (1 - labels) * np.log(1 - preds))))
 
 
-def xgboost_batch(folder, meta, threads, repeats):
+def xgboost_batch(folder, meta, threads, repeats, device):
     x = np.fromfile(folder / "X.bin", dtype="<f4").reshape(-1, meta["n_cols"])
     y = np.fromfile(folder / "y.bin", dtype="<f4")
     xt = np.fromfile(folder / "X_test.bin", dtype="<f4").reshape(-1, meta["n_cols"])
@@ -98,7 +102,7 @@ def xgboost_batch(folder, meta, threads, repeats):
     params = {
         "objective": meta["objective"],
         "tree_method": "hist",
-        "device": "cpu",
+        "device": device,
         "grow_policy": "depthwise",
         "max_depth": meta["max_depth"],
         "eta": meta["eta"],
@@ -154,6 +158,9 @@ def main():
         "--repeats", type=int, default=3, help="Measured fits per batch; two batches per engine"
     )
     parser.add_argument("--rows", type=int, help="Override training rows for a smoke check")
+    parser.add_argument(
+        "--device", choices=["cpu", "cuda"], default="cpu", help="Device both engines train on"
+    )
     args = parser.parse_args()
     counts = [*args.threads, args.rounds, args.repeats, 1 if args.rows is None else args.rows]
     if min(counts) < 1:
@@ -166,6 +173,18 @@ def main():
         if sys.platform == "darwin"
         else platform.processor()
     )
+    gpu = (
+        subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,driver_version,ecc.mode.current",
+                "--format=csv,noheader",
+            ],
+            text=True,
+        ).strip()
+        if args.device == "cuda"
+        else None
+    )
     sources = [
         Path(__file__),
         Path("examples/bench_compare.rs"),
@@ -177,6 +196,8 @@ def main():
         "metadata": {
             "started_at": datetime.now(UTC).isoformat(),
             "cpu": cpu,
+            "device": args.device,
+            "gpu": gpu,
             "platform": platform.platform(),
             "python": sys.version,
             "numpy": np.__version__,
@@ -211,12 +232,13 @@ def main():
             for engine in report["metadata"]["order"]:
                 started = datetime.now(UTC).isoformat()
                 if engine == "xgboost":
-                    batch = xgboost_batch(folder, meta, threads, args.repeats)
+                    batch = xgboost_batch(folder, meta, threads, args.repeats, args.device)
                 else:
                     env = dict(
                         os.environ,
                         BENCH_DIR=str(folder.resolve()),
                         BENCH_REPEATS=str(args.repeats),
+                        BENCH_DEVICE=args.device,
                         RAYON_NUM_THREADS=str(threads),
                     )
                     batch = json.loads(subprocess.check_output([str(executable)], env=env))

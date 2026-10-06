@@ -1,22 +1,23 @@
 //! One boosting round: gradients, row subsets, and the trees of an iteration
 //! (or `process_type=update`'s refresh of them).
 
-use super::dart::{dart_new_tree_weight, finish_dart, round_gradients};
+use super::dart::{dart_new_tree_weight, finish_dart, round_gradients, round_rng, round_salt};
 use super::margins::{MarginCaches, TreeOutput};
 use super::prepare::{Prepared, TrainContext, TreeSample, approx_index};
 use super::row_sampling::{gradient_sampling, iteration_row_subsets, make_column_sampler};
-use crate::config::{Device, Refresh, TrainingParams};
+use crate::config::{BoosterKind, Device, Refresh, SamplingMethod, TrainingParams};
 use crate::data::ghist::GHistIndex;
 use crate::error::Result;
 use crate::model::BoostedModel;
-use crate::objective::GradPair;
+use crate::objective::{GradPair, MIN_HESS, Objective};
 use crate::rng::Rng;
 use crate::training::multi_output;
 use crate::training::refresh::refresh_tree;
 use crate::training::sampling::{GradientSample, gradient_based_sample};
 use crate::training::sglb::LeafRenewal;
 use crate::tree::RegTree;
-use crate::tree::builder::LeafRows;
+use crate::tree::builder::{HistTreeBuilder, LeafRows};
+use crate::tree::hist::{DeviceLoss, Segment};
 use crate::tree::reuse::ReuseSet;
 use crate::tree::sampler::ColumnSampler;
 use rayon::prelude::*;
@@ -37,6 +38,122 @@ pub(super) struct RoundState<'a> {
     pub(super) noisy_gpair: Vec<GradPair>,
     /// Every training row, ascending: the rows of an unsampled round.
     pub(super) all_rows: Vec<u32>,
+    /// Whether a GPU holds the current training margins (device-resident
+    /// rounds), so `margins.train` is stale until read back.
+    pub(super) device_margins: bool,
+}
+
+/// A device-resident round ([`device_round`]) applies: the GPU computes
+/// the gradients from its own margins, grows the tree with the rows on the
+/// device, and adds the leaves to its margins, so nothing per row crosses
+/// the bus. Only for configurations whose every step the device reproduces
+/// bit for bit: `reg:squarederror` or a logistic objective (when the host
+/// computes its gradients with a vector kernel) on one label column, one
+/// tree per iteration of a plain `gbtree`, every row in every tree, and
+/// none of the options that read the host's gradients or rows (SGLB,
+/// linear leaves, reuse penalties, model shrinkage).
+fn device_round_applies(run: &TrainContext, state: &RoundState) -> Option<DeviceLoss> {
+    let TrainContext {
+        params,
+        dtrain,
+        objective,
+        langevin,
+        ..
+    } = *run;
+    let plain = objective.n_outputs() == 1
+        && dtrain.n_targets() == 1
+        && params.num_parallel_tree == 1
+        && params.booster == BoosterKind::GbTree
+        && params.sampling_method == SamplingMethod::Uniform
+        && params.subsample >= 1.0
+        && params.balanced_bagging.is_none()
+        && params.bagging_by_query.is_none()
+        && params.linear_tree.is_none()
+        && params.model_shrink.is_none()
+        && langevin.is_none()
+        && state.reuse.is_none();
+    if !plain {
+        return None;
+    }
+    // The scale `Objective::build_loss` gives the loss.
+    match &params.objective {
+        Objective::SquaredError(loss) => Some(DeviceLoss::SquaredError {
+            scale_pos_weight: loss.scale_pos_weight() as f32,
+        }),
+        Objective::RegLogistic(loss)
+        | Objective::BinaryLogistic(loss)
+        | Objective::BinaryLogitRaw(loss) => Some(DeviceLoss::Logistic {
+            scale_pos_weight: loss.scale_pos_weight() as f32,
+            min_hess: MIN_HESS,
+            split: crate::simd::logistic_vector_split(dtrain.n_rows())?,
+        }),
+        _ => None,
+    }
+}
+
+/// Grow iteration `iteration` as a device-resident round when it applies
+/// and the device succeeds; `None` leaves the round to the host path (which
+/// first brings the host margins up to date).
+fn device_round(
+    run: &TrainContext,
+    prepared: &Prepared,
+    iteration: usize,
+    state: &mut RoundState,
+) -> Option<()> {
+    let loss = device_round_applies(run, state)?;
+    let TrainContext {
+        params,
+        dtrain,
+        info,
+        ..
+    } = *run;
+    let (index, backend) = prepared.device_backend()?;
+    let engine = backend.row_engine()?;
+    if !state.device_margins {
+        engine.load_margins(&state.margins.train)?;
+        state.device_margins = true;
+    }
+    // The host's gradients (`gradient_info_at` of the loss), on the device;
+    // non-finite ones, and rows only the host reproduces, grow on the host.
+    if !engine.gradients(loss, info.label_values(), info.weights)? {
+        return None;
+    }
+    // The host round's RNG draws: no dropout, no row sample, then the
+    // tree's column sampler (and no quantization seed).
+    let mut rng = round_rng(params, iteration, round_salt(params));
+    let mut sampler = make_column_sampler(dtrain, params, &mut rng);
+    let builder = HistTreeBuilder::new(params).with_backend(backend);
+    let (mut tree, leaves) = builder.build_device_staged(index, &state.all_rows, &mut sampler)?;
+    tree.scale_leaves(tree_eta(params));
+    let values: Vec<(Segment, f32)> = leaves
+        .iter()
+        .map(|&(node, seg)| (seg, tree.node(node).leaf_value))
+        .collect();
+    engine.add_leaf_values(&values)?;
+    state
+        .margins
+        .add_tree_to_evals(&tree, TreeOutput::Scalar(0));
+    state
+        .model
+        .push_tree_weighted(tree, dart_new_tree_weight(None, params));
+    Some(())
+}
+
+/// Bring `state.margins.train` up to date when the device holds the
+/// current margins: read them back, or (after a device failure) recompute
+/// them from the model, which reproduces the incremental sums.
+fn sync_host_margins(prepared: &Prepared, state: &mut RoundState) {
+    if !state.device_margins {
+        return;
+    }
+    state.device_margins = false;
+    let read = prepared
+        .device_backend()
+        .and_then(|(_, backend)| backend.row_engine())
+        .and_then(|engine| engine.read_margins(&mut state.margins.train));
+    if read.is_none() {
+        state.margins.recompute_train(&state.model);
+    }
 }
 
 /// `process_type=update`: refresh iteration `iteration`'s trees of `queue`
@@ -91,6 +208,10 @@ pub(super) fn grow_round(
         objective,
         ..
     } = *run;
+    if device_round(run, prepared, iteration, state).is_some() {
+        return Ok(());
+    }
+    sync_host_margins(prepared, state);
     let n = dtrain.n_rows();
     let n_out = objective.n_outputs();
     let parallel = params.num_parallel_tree;

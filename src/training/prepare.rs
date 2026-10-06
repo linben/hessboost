@@ -79,6 +79,17 @@ pub(super) enum Prepared {
 }
 
 impl Prepared {
+    /// The binned index and backend of a histogram run whose backend keeps
+    /// the rows on a device (the CUDA backend), for device-resident rounds.
+    pub(super) fn device_backend(&self) -> Option<(&GHistIndex, &dyn HistogramBackend)> {
+        match self {
+            Prepared::Hist { index, backend, .. } if backend.row_engine().is_some() => {
+                Some((index, backend.as_ref()))
+            }
+            _ => None,
+        }
+    }
+
     /// Grow one tree on `sample`, with the rows that reached each leaf when
     /// `capture_rows` (histogram and exact methods; empty otherwise). With reuse
     /// penalties (`reuse` is `Some`) the split search is penalized by the
@@ -306,8 +317,9 @@ pub(super) fn prepare_builder(
 }
 
 /// The histogram backend a training run builds on: the Metal GPU's when
-/// `device = metal` (the parameter validation has already checked the
-/// platform and feature), else the CPU's.
+/// `device = metal`, the CUDA GPU's when `device = cuda` (the parameter
+/// validation has already checked the platform and feature), else the
+/// CPU's.
 fn hist_backend(params: &TrainingParams, index: &GHistIndex) -> Result<Box<dyn HistogramBackend>> {
     match params.device {
         Device::Cpu => {
@@ -330,6 +342,23 @@ fn hist_backend(params: &TrainingParams, index: &GHistIndex) -> Result<Box<dyn H
                 Err(HessboostError::invalid_param(
                     "device",
                     "`metal` requires building with the `metal` feature on macOS",
+                ))
+            }
+        }
+        Device::Cuda { ordinal } => {
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
+            {
+                let backend: Box<dyn HistogramBackend> =
+                    Box::new(crate::backend::cuda::CudaHistBackend::new(index, ordinal)?);
+                Ok(backend)
+            }
+            #[cfg(not(all(target_os = "linux", feature = "cuda")))]
+            {
+                // Unreachable in practice, as for Metal above.
+                let _ = (index, ordinal);
+                Err(HessboostError::invalid_param(
+                    "device",
+                    "`cuda` requires building with the `cuda` feature on Linux",
                 ))
             }
         }

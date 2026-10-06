@@ -9,6 +9,8 @@ use crate::objective::GradPair;
 use crate::tree::RegTree;
 use crate::tree::constraints::{Bounds, MonotoneConstraints, calc_weight_bounded};
 use crate::tree::gain::{GradStats, RegParams, threshold_l1};
+use crate::tree::hist::{SumOrder, sum_order};
+use rayon::prelude::*;
 
 /// Whether the rayon pool has more than one thread, so parallelism can pay off.
 pub(super) fn rayon_available() -> bool {
@@ -154,14 +156,40 @@ pub(super) fn permits(state: Option<&InteractionState>, feature: u32) -> bool {
     state.is_none_or(|state| state.allowed.binary_search(&feature).is_ok())
 }
 
-/// Sum the gradient pairs of `rows`, in row order. Shared by the builders'
+/// Sum the gradient pairs of `rows` in the histograms' order
+/// ([`sum_order`]): a node below 8,192 rows in row order, a larger one in
+/// blocks, each a chain from zero, the block totals added in block order to
+/// the first. The blocks depend on the row count alone, so the parallel and
+/// serial sums agree (and a GPU reproduces them). Shared by the builders'
 /// root-statistics accumulation.
+pub(crate) fn sum_rows(gpair: &[GradPair], rows: &[u32]) -> GradStats {
+    let SumOrder::Blocked { grain } = sum_order(rows.len()) else {
+        return chain_rows(gpair, rows);
+    };
+    let partials: Vec<GradStats> = if rayon_available() {
+        rows.par_chunks(grain)
+            .map(|block| chain_rows(gpair, block))
+            .collect()
+    } else {
+        rows.chunks(grain)
+            .map(|block| chain_rows(gpair, block))
+            .collect()
+    };
+    let mut partials = partials.into_iter();
+    let mut total = partials.next().unwrap_or_default();
+    for partial in partials {
+        total.add(partial);
+    }
+    total
+}
+
+/// The row-order chain of `rows`' gradient pairs, from zero.
 ///
 /// Kept out of line: inlined into `HistTreeBuilder::build_inner`, LLVM kept
 /// the running sum in the caller's stack slot and paid a store-to-load round
 /// trip per row.
 #[inline(never)]
-pub(super) fn sum_rows(gpair: &[GradPair], rows: &[u32]) -> GradStats {
+fn chain_rows(gpair: &[GradPair], rows: &[u32]) -> GradStats {
     let mut total = GradStats::default();
     for &r in rows {
         total.add(GradStats::from_pair(gpair[r as usize]));

@@ -39,7 +39,7 @@ use crate::rng::Rng;
 
 /// Draws feature subsets for one tree according to the `bytree`, `bylevel`,
 /// and `bynode` ratios, optionally weighted by per-feature weights.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ColumnSampler {
     tree: Arc<[u32]>,
     /// `bylevel` subsets by depth, drawn lazily (the tree pool itself when

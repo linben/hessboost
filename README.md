@@ -171,6 +171,7 @@ See [`python/README.md`](python/README.md).
   - [Compact models](https://docs.rs/hessboost/latest/hessboost/model/compact/): Bit-packed model format with identical margins.
   - [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/): Training controlled by one budget value, based on PerpetualBooster.
   - [Metal GPU](https://docs.rs/hessboost/latest/hessboost/backend/metal/): Apple Silicon GPU prediction and training (`--features metal`).
+  - [CUDA GPU](https://docs.rs/hessboost/latest/hessboost/backend/cuda/): NVIDIA GPU training on Linux (`--features cuda`), bit-identical to the CPU; rows, histograms, and split scans stay on the GPU.
 
 ## Caveats
 
@@ -181,7 +182,7 @@ See [`python/README.md`](python/README.md).
 
 - Distributed and external-memory training.
 - CLI and C bindings.
-- GPU training outside macOS (a `wgpu` backend is planned).
+- GPU training on Windows, and GPU prediction outside macOS.
 - A few XGBoost options exist at one setting only, and a few metrics are
   missing; the [API docs](https://docs.rs/hessboost/latest/hessboost/#not-implemented)
   list them.

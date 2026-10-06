@@ -237,6 +237,7 @@ fn train_trees<'a>(
         reuse,
         noisy_gpair: Vec::new(),
         all_rows: all_rows(n),
+        device_margins: false,
     };
     if start_iteration > 0
         && let RoundPlan::Grow(prepared) = &plan

@@ -13,7 +13,7 @@ mod walk;
 
 use crate::data::ghist::GHistIndex;
 use crate::objective::GradPair;
-use crate::tree::gain::GradStats;
+use crate::tree::gain::{GradStats, RegParams};
 use rayon::prelude::*;
 use walk::{Bucket, RowValue, SweepRows, accumulate, by_features, contiguous_range};
 
@@ -78,23 +78,205 @@ pub trait HistogramBackend: Send + Sync {
     /// Backends that stage the gradients (a GPU) upload them here; the
     /// default does nothing.
     fn prepare(&self, _ghist: &GHistIndex, _gpair: &[GradPair]) {}
+
+    /// The device-resident row engine of a backend that keeps a tree's
+    /// rows on its device (a GPU), letting the hist builder partition and
+    /// build whole levels there. `None` (the default): the builder keeps
+    /// rows on the host and calls [`build`](Self::build) per node.
+    fn row_engine(&self) -> Option<&dyn RowEngine> {
+        None
+    }
+}
+
+/// A node's rows as a [`RowEngine`] keeps them: `len` ascending row ids at
+/// `offset` of the engine's row buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Segment {
+    pub(crate) offset: usize,
+    pub(crate) len: usize,
+}
+
+/// Where a split sends a row's present bin of the split feature; a missing
+/// value follows the split's `default_left`.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "cuda")),
+    allow(dead_code, reason = "only the CUDA row engine reads the rule")
+)]
+pub enum RowRule<'a> {
+    /// Feature-local bins below the limit go left.
+    Below(u32),
+    /// `left[local bin]`: a categorical split's per-bin direction.
+    Table(&'a [bool]),
+}
+
+/// One node to partition: its rows and how its split routes them.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "cuda")),
+    allow(dead_code, reason = "only the CUDA row engine reads the split")
+)]
+pub struct RowSplit<'a> {
+    pub(crate) seg: Segment,
+    pub(crate) feature: u32,
+    pub(crate) rule: RowRule<'a>,
+    pub(crate) default_left: bool,
+}
+
+/// A partitioned node: the left child holds the segment's first rows, the
+/// right child the rest, both in ascending order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Partitioned {
+    pub(crate) left: Segment,
+    pub(crate) right: Segment,
+}
+
+/// Device-resident tree growth ([`HistogramBackend::row_engine`]): a tree's
+/// rows live in one device buffer, each node a [`Segment`] of it, and the
+/// builder partitions and builds histograms a whole level at a time. Every
+/// histogram equals [`CpuBackend::build`]'s of the same rows bit for bit,
+/// and partitions are stable, so the tree is the host builder's.
+///
+/// Every method returns `None` after a device failure; the builder then
+/// regrows the tree on the host (or, when the device also holds the
+/// gradients, the trainer redoes the round on the host).
+pub trait RowEngine: Sync {
+    /// Start a tree over `rows` (ascending, distinct), with the gradients
+    /// staged ([`HistogramBackend::prepare`], or [`Self::gradients`]):
+    /// the root's segment.
+    fn begin_tree(&self, ghist: &GHistIndex, rows: &[u32]) -> Option<Segment>;
+
+    /// The statistics of `seg`'s rows, the host `sum_rows`'s blocks summed
+    /// on the device (exactly in integers where their sums are exact, else
+    /// as `f64` chains) and added in block order: the host's sum bit for
+    /// bit. `None` for non-finite gradients.
+    fn root_total(&self, seg: Segment) -> Option<GradStats>;
+
+    /// Partition each split's segment in place (stable), in one batch.
+    fn partition(&self, ghist: &GHistIndex, splits: &[RowSplit<'_>]) -> Option<Vec<Partitioned>>;
+
+    /// The histograms of the nodes, in one batch. `gpair` is the host copy
+    /// of the staged gradients, `None` when only the device has them.
+    fn histograms(
+        &self,
+        ghist: &GHistIndex,
+        gpair: Option<&[GradPair]>,
+        nodes: &[Segment],
+    ) -> Option<Vec<Histogram>>;
+
+    /// The row ids of each segment.
+    fn rows(&self, segs: &[Segment]) -> Option<Vec<Vec<u32>>>;
+
+    /// Keep `margins` (one per row) on the device for device-side rounds.
+    fn load_margins(&self, margins: &[f32]) -> Option<()>;
+
+    /// Stage `loss`'s gradients of the device margins for the next tree,
+    /// exactly as the host computes them: whether they are all finite (a
+    /// tree with non-finite gradients, or rows the device cannot reproduce,
+    /// must grow on the host).
+    fn gradients(&self, loss: DeviceLoss, labels: &[f32], weights: Option<&[f32]>) -> Option<bool>;
+
+    /// Add each leaf's value to the device margins of its rows.
+    fn add_leaf_values(&self, leaves: &[(Segment, f32)]) -> Option<()>;
+
+    /// Copy the device margins into `out`.
+    fn read_margins(&self, out: &mut [f32]) -> Option<()>;
+
+    /// Reserve `slots` device histograms for resident growth (histograms
+    /// built, subtracted, and searched where they are): `Some(false)`, with
+    /// nothing reserved, when they do not fit.
+    fn reserve_hists(&self, ghist: &GHistIndex, slots: usize) -> Option<bool>;
+
+    /// Build each `(segment, slot)` node's histogram into its slot, then
+    /// turn each `(parent, built)` pair's parent slot into the sibling
+    /// `parent - built` ([`subtract_in_place`]). `gpair` as for
+    /// [`Self::histograms`].
+    fn build_resident(
+        &self,
+        ghist: &GHistIndex,
+        gpair: Option<&[GradPair]>,
+        nodes: &[(Segment, HistSlot)],
+        siblings: &[(HistSlot, HistSlot)],
+    ) -> Option<()>;
+
+    /// The numeric split scan (`scan_numeric_splits` in
+    /// `tree::builder::split`) of every request's features on its slot's
+    /// histogram, request by request, feature by feature.
+    fn scan_resident(
+        &self,
+        ghist: &GHistIndex,
+        reg: &RegParams,
+        requests: &[ScanRequest<'_>],
+    ) -> Option<Vec<FeatureScan>>;
+
+    /// A slot's histogram, read back.
+    fn read_hist(&self, slot: HistSlot) -> Option<Histogram>;
+}
+
+/// A [`RowEngine`] histogram slot.
+pub type HistSlot = u32;
+
+/// One node's split scan on the device: its histogram's slot, statistics,
+/// `root_gain` and monotone bounds (as the scorer uses them, in `f32`), and
+/// the numeric features to scan, each with its monotone direction.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanRequest<'a> {
+    pub slot: HistSlot,
+    pub total: GradStats,
+    pub root_gain: f32,
+    pub lower: f32,
+    pub upper: f32,
+    pub features: &'a [(u32, i8)],
+}
+
+/// One feature's numeric split scan, as `scan_numeric_splits` reports it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FeatureScan {
+    /// No candidate has a finite loss change.
+    Empty,
+    /// Some candidate scored NaN: the host replays the feature.
+    Nan,
+    /// The first candidate with the largest finite loss change: in the
+    /// forward pass (bins `..= offset` left, missing right) or the backward
+    /// one (bins `>= offset` right, missing left), with that pass's
+    /// accumulated statistics (the left child's forward, the right's
+    /// backward).
+    Best {
+        loss_chg: f32,
+        backward: bool,
+        offset: u32,
+        acc: GradStats,
+    },
+}
+
+/// A loss whose gradients a [`RowEngine`] computes from its margins with
+/// the host's bits.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DeviceLoss {
+    /// `reg:squarederror`.
+    SquaredError { scale_pos_weight: f32 },
+    /// `reg:logistic`, `binary:logistic`, `binary:logitraw`: the host's
+    /// vector kernel over `split.rows`, its scalar path (on the host) after.
+    Logistic {
+        scale_pos_weight: f32,
+        min_hess: f32,
+        split: crate::simd::VectorSplit,
+    },
 }
 
 /// Multi-core CPU histogram backend.
 ///
-/// Each bin's `f64` sum is a function of the rows alone, never of the
-/// thread count, so the serial and parallel builds agree bit for bit. A node
-/// below 8,192 rows, and a column-major index swept by feature (a
-/// contiguous row range, or any subset of an index of at most 2^18 rows),
-/// add each bin's rows in ascending order: the plain chain XGBoost's
-/// single-threaded build forms. Every other node (a sparse index, or a row
-/// subset of a larger dense one) sums fixed blocks of about 4,096 rows,
-/// each in row order from zero, and adds
-/// the block partials to the first block's in block order. Outside the
-/// range where `f64` sums are exact (`backend/exact_sum.rs`) that can round
-/// differently from the chain, which XGBoost's threaded build does too
-/// (its per-thread buffers are reduced in thread order); inside it every
-/// grouping gives the chain's sum.
+/// Each bin's `f64` sum is a function of the node's row count alone, never
+/// of the thread count or the index layout, so the serial and parallel
+/// builds agree bit for bit and a GPU backend can reproduce them in
+/// parallel. A node below 8,192 rows adds each bin's rows in ascending
+/// order: the plain chain XGBoost's single-threaded build forms. A larger
+/// node sums fixed blocks of about 4,096 rows, each in row order from zero,
+/// and adds the block partials to the first block's in block order.
+/// Outside the range where `f64` sums are exact (`backend/exact_sum.rs`)
+/// that can round differently from the chain, which XGBoost's threaded
+/// build does too (its per-thread buffers are reduced in thread order);
+/// inside it every grouping gives the chain's sum.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CpuBackend;
 
@@ -102,53 +284,74 @@ pub struct CpuBackend;
 /// enough to amortize a partial histogram's zeroing and reduction.
 const ROWS_PER_TASK: usize = 4096;
 /// Nodes below this many rows are one block (built as a single chain).
-const PARALLEL_THRESHOLD: usize = 2 * ROWS_PER_TASK;
+pub(crate) const PARALLEL_THRESHOLD: usize = 2 * ROWS_PER_TASK;
 /// Bins per task when the partial histograms are summed.
 const REDUCE_BINS: usize = 2048;
-/// Datasets up to this many rows gather row subsets feature by feature: the
+/// Datasets up to this many rows build row subsets feature by feature: the
 /// gradients (8 bytes a row) then fit a core's 2 MiB L2.
 const GATHER_MAX_ROWS: usize = 1 << 18;
 
-impl HistogramBackend for CpuBackend {
-    fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
-        if rows.len() < PARALLEL_THRESHOLD {
-            out.fill(GradStats::default());
-            accumulate(ghist, rows, gpair, out);
-            return;
-        }
-        let threads = rayon::current_num_threads();
-        let Some(columns) = ghist.column_bins() else {
-            accumulate_blocks(ghist, rows, gpair, out, threads);
-            return;
-        };
-        let range = contiguous_range(rows);
-        if range.is_none() && ghist.n_rows() > GATHER_MAX_ROWS {
-            accumulate_blocks(ghist, rows, gpair, out, threads);
-            return;
-        }
-        // The feature sweeps below are chains in row order, as is
-        // `accumulate`, which runs them serially.
-        if threads <= 1 {
-            out.fill(GradStats::default());
-            accumulate(ghist, rows, gpair, out);
-            return;
-        }
+/// The order in which [`CpuBackend`] adds each bin's rows: a function of
+/// the node's row count alone. A device backend reproducing the CPU's `f64`
+/// sums bit for bit follows the same order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SumOrder {
+    /// One chain in ascending row order, from `+0.0`.
+    Chain,
+    /// `rows.chunks(grain)`, each chained in row order from `+0.0`; the bin
+    /// is the first chunk's partial plus every later one in chunk order.
+    /// The chunk count is `rows.len().div_ceil(grain)`, which falls below
+    /// `rows.len() / ROWS_PER_TASK` past about 16.8M rows: count chunks from
+    /// `grain`, never from the row count.
+    Blocked {
+        /// Rows per chunk (the last one shorter).
+        grain: usize,
+    },
+}
 
-        // A contiguous row range with a column-major copy is split by
-        // feature. Any other row subset of a small enough column-major index
-        // is gathered the same way: every feature group re-reads the
-        // gradients, so this pays only while they stay in a core's cache.
-        let rows = match range {
-            Some(range) => SweepRows::Range(range),
-            None => SweepRows::Subset(rows),
-        };
-        by_features(ghist, &columns, &rows, gpair, out, threads);
+/// The summation order [`CpuBackend::build`] uses for a node of `len` rows:
+/// one chain below [`PARALLEL_THRESHOLD`] rows, else `len / 4096` equal
+/// blocks.
+pub(crate) fn sum_order(len: usize) -> SumOrder {
+    if len < PARALLEL_THRESHOLD {
+        return SumOrder::Chain;
+    }
+    let blocks = len / ROWS_PER_TASK;
+    SumOrder::Blocked {
+        grain: len.div_ceil(blocks),
     }
 }
 
-/// The blocked build of [`CpuBackend`]: `rows` (at least
-/// [`PARALLEL_THRESHOLD`]) split into `rows.len() / ROWS_PER_TASK` blocks
-/// of equal size (the last shorter), each accumulated from zero into a
+impl HistogramBackend for CpuBackend {
+    fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
+        let SumOrder::Blocked { grain } = sum_order(rows.len()) else {
+            out.fill(GradStats::default());
+            accumulate(ghist, rows, gpair, out);
+            return;
+        };
+        let threads = rayon::current_num_threads();
+        // With a column-major copy, a contiguous row range, or any row
+        // subset of an index small enough that every feature group's
+        // re-read of the gradients stays in a core's cache, is split by
+        // feature; both builds sum the same blocks in the same order.
+        let range = contiguous_range(rows);
+        let columns = ghist
+            .column_bins()
+            .filter(|_| threads > 1 && (range.is_some() || ghist.n_rows() <= GATHER_MAX_ROWS));
+        if let Some(columns) = columns {
+            let rows = match range {
+                Some(range) => SweepRows::Range(range),
+                None => SweepRows::Subset(rows),
+            };
+            by_features(ghist, &columns, &rows, gpair, out, grain, threads);
+        } else {
+            accumulate_blocks(ghist, rows, gpair, out, grain, threads);
+        }
+    }
+}
+
+/// The blocked build of [`CpuBackend`] ([`SumOrder::Blocked`]): `rows`
+/// split into `rows.chunks(grain)`, each accumulated from zero into a
 /// partial histogram, and `out` = the first partial plus every later one in
 /// block order. The blocks depend only on the row count; `threads` only
 /// sets how many are built at once (in waves, each reduced into `out`
@@ -158,11 +361,11 @@ fn accumulate_blocks(
     rows: &[u32],
     gpair: &[GradPair],
     out: &mut [GradStats],
+    grain: usize,
     threads: usize,
 ) {
     let total = out.len();
-    let blocks = rows.len() / ROWS_PER_TASK;
-    let grain = rows.len().div_ceil(blocks);
+    let blocks = rows.len().div_ceil(grain);
     let wave = threads.clamp(1, blocks);
     let mut partials: Vec<Histogram> = Vec::with_capacity(wave);
     for (w, wave_rows) in rows.chunks(grain * wave).enumerate() {
@@ -267,8 +470,7 @@ mod tests {
     }
 
     /// Row-major reference independent of `accumulate`: every bin receives
-    /// its rows in ascending order, which is the order both the row sweep and
-    /// the column sweep must reproduce bit for bit.
+    /// its rows in ascending order.
     fn row_order_reference(ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair]) -> Histogram {
         let stride = ghist.dense_stride().expect("dense index");
         let mut h = zeroed(ghist.total_bins());
@@ -286,8 +488,29 @@ mod tests {
         h
     }
 
+    /// The block-order reference of a dense index: [`row_order_reference`]
+    /// of each `grain`-row chunk, the partials added in chunk order to the
+    /// first one.
+    fn block_order_reference(ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair]) -> Histogram {
+        let SumOrder::Blocked { grain } = sum_order(rows.len()) else {
+            return row_order_reference(ghist, rows, gpair);
+        };
+        let mut chunks = rows.chunks(grain);
+        let mut h = row_order_reference(ghist, chunks.next().unwrap_or(&[]), gpair);
+        for chunk in chunks {
+            for (o, p) in h.iter_mut().zip(row_order_reference(ghist, chunk, gpair)) {
+                o.add(p);
+            }
+        }
+        h
+    }
+
+    /// On a dense index the feature-parallel sweep (several threads) and
+    /// the row-blocked build (one thread) both give the block-order
+    /// reference bit for bit, for contiguous ranges and row subsets, on
+    /// gradients spanning enough exponents that the grouping shows.
     #[test]
-    fn column_and_row_sweeps_match_reference_bit_for_bit() {
+    fn dense_builds_match_the_block_order_reference() {
         let (n, f) = (3 * PARALLEL_THRESHOLD + 129, 7);
         let x: Vec<f32> = (0..n * f)
             .map(|i| ((i * 2_654_435_761_usize) % 1009) as f32 / 7.0)
@@ -301,8 +524,9 @@ mod tests {
         );
         let gpair: Vec<GradPair> = (0..n)
             .map(|i| {
+                let scale = 2f32.powi((i * 37 % 61) as i32 - 30);
                 GradPair::new(
-                    ((i * 7919) % 1237) as f32 / 331.0 - 1.9,
+                    ((i * 7919) % 1237) as f32 / 331.0 * scale - 1.9,
                     0.25 + (i % 5) as f32,
                 )
             })
@@ -318,8 +542,13 @@ mod tests {
         assert!(contiguous_range(&all).is_some() && contiguous_range(&offset).is_some());
         assert!(contiguous_range(&subset).is_none());
         assert!(contiguous_range(&[2, 0, 1]).is_none() && contiguous_range(&[5, 5]).is_none());
+        assert_ne!(
+            bits(&block_order_reference(&ghist, &all, &gpair)),
+            bits(&row_order_reference(&ghist, &all, &gpair)),
+            "the case must separate the groupings"
+        );
         for rows in [&all, &subset, &offset] {
-            let expect = bits(&row_order_reference(&ghist, rows, &gpair));
+            let expect = bits(&block_order_reference(&ghist, rows, &gpair));
             for threads in [1, 4] {
                 let mut out = zeroed(ghist.total_bins());
                 rayon::ThreadPoolBuilder::new()
